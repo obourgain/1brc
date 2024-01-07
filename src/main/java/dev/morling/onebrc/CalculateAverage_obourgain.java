@@ -43,7 +43,6 @@ public class CalculateAverage_obourgain {
 
     static class ThreadLocalState {
         private final OpenAddressingMap resultMap = new OpenAddressingMap();
-        private final byte[] cityNameBuffer = new byte[128];
     }
 
     private static final ThreadLocal<ThreadLocalState> THREAD_LOCAL_STATE = ThreadLocal.withInitial(ThreadLocalState::new);
@@ -181,11 +180,12 @@ public class CalculateAverage_obourgain {
     private static long processLineInChunk(MemorySegment segment, long position, ThreadLocalState threadLocalState) {
         // compute hashCode for the city name, copy the bytes to a buffer and search for the semicolon all at once, so we don' t visit the same byte twice
         // the packing is used to return two ints. The alternative is to return an int and add a mutable field to ThreadLocalState, but that's a bit slower
-        long packed_cityNameLength_hashCode = getCityNameLength(segment, position, threadLocalState);
+        long startOfLine = position;
+        long packed_cityNameLength_hashCode = getCityNameLength(segment, position);
         int cityNameLength = (int) (packed_cityNameLength_hashCode >> 32);
         int hashCode = (int) packed_cityNameLength_hashCode;
 
-        MeasurementAggregator perCityStats = threadLocalState.resultMap.getOrCreate(threadLocalState, cityNameLength, hashCode);
+        MeasurementAggregator perCityStats = threadLocalState.resultMap.getOrCreate(segment, startOfLine, cityNameLength, hashCode);
 
         // I tried packing for decodeDouble, but here it is slower than passing the MeasurementAggregator
         // + 1 for the semicolon
@@ -193,10 +193,9 @@ public class CalculateAverage_obourgain {
         return position;
     }
 
-    static long getCityNameLength(MemorySegment segment, long position, ThreadLocalState threadLocalState) {
+    static long getCityNameLength(MemorySegment segment, long position) {
         long cityNameLength = 0;
         int cityNameHashCode = 0;
-        byte[] cityNameBuffer = threadLocalState.cityNameBuffer;
 
         while (true) {
             // trick: we know that we will have a value after the semicolon which is at least 3 bytes, so we can unroll the loop
@@ -205,7 +204,7 @@ public class CalculateAverage_obourgain {
 
             // if (USE_UNSAFE) {
             // put all four bytes at once, we'll use cityNameLength to not read past the actual end of the buffer
-            UNSAFE.putInt(cityNameBuffer, BYTE_ARRAY_OFFSET_BASE + cityNameLength, Integer.reverseBytes(i));
+            // UNSAFE.putInt(cityNameBuffer, BYTE_ARRAY_OFFSET_BASE + cityNameLength, Integer.reverseBytes(i));
             // }
 
             byte b0 = (byte) (i >>> 24);
@@ -418,17 +417,16 @@ public class CalculateAverage_obourgain {
             }
         }
 
-        public MeasurementAggregator getOrCreate(ThreadLocalState threadLocalState, int cityNameLength, int cityNameHashCode) {
+        public MeasurementAggregator getOrCreate(MemorySegment segment, long startOfLine, int cityNameLength, int cityNameHashCode) {
             // as I mask I lose some bits. Reinject those bit to avoid too many collisions. Maybe expert in hashing can help?
             cityNameHashCode = (cityNameHashCode >> 16) ^ cityNameHashCode;
 
-            byte[] cityNameBuffer = threadLocalState.cityNameBuffer;
             int keyIndex = cityNameHashCode & MASK;
 
             MeasurementAggregator value;
             while (null != (value = values[keyIndex])) {
                 byte[] existingKey = keys[keyIndex];
-                if (existingKey.length == cityNameLength && arrayEquals(existingKey, cityNameBuffer, (byte) cityNameLength)) {
+                if (existingKey.length == cityNameLength && arrayEqualsMemory(existingKey, segment, startOfLine, (byte) cityNameLength)) {
                     return value;
                 }
                 // }
@@ -436,11 +434,13 @@ public class CalculateAverage_obourgain {
                 // go to next slot
                 keyIndex = (keyIndex + 1) & MASK;
             }
-            return create(cityNameLength, cityNameBuffer, keyIndex);
+            return create(cityNameLength, segment, startOfLine, keyIndex);
         }
 
-        private MeasurementAggregator create(int cityNameLength, byte[] cityNameBuffer, int keyIndex) {
-            byte[] key = Arrays.copyOf(cityNameBuffer, cityNameLength);
+        private MeasurementAggregator create(int cityNameLength, MemorySegment segment, long startOfLine, int keyIndex) {
+            byte[] key = new byte[cityNameLength];
+            UNSAFE.copyMemory(null, segment.address() + startOfLine, key, BYTE_ARRAY_OFFSET_BASE, cityNameLength);
+            // byte[] key = Arrays.copyOf(cityNameBuffer, cityNameLength);
             keys[keyIndex] = key;
             MeasurementAggregator value = new MeasurementAggregator();
             values[keyIndex] = value;
@@ -451,11 +451,12 @@ public class CalculateAverage_obourgain {
 
     static final AtomicLong COLLISIONS = new AtomicLong();
 
-    static boolean arrayEquals(byte[] existingKey, byte[] cityNameBuffer, byte length) {
+    static boolean arrayEqualsMemory(byte[] existingKey, MemorySegment segment, long startOfLine, byte length) {
+        long startAddress = segment.address();
         int i = 0;
         while (i != length) {
             if (length >= 8) {
-                if (UNSAFE.getLong(existingKey, BYTE_ARRAY_OFFSET_BASE + i) != UNSAFE.getLong(cityNameBuffer, BYTE_ARRAY_OFFSET_BASE + i)) {
+                if (UNSAFE.getLong(existingKey, BYTE_ARRAY_OFFSET_BASE + i) != UNSAFE.getLong(startAddress + startOfLine + i)) {
                     return false;
                 }
                 else {
@@ -463,7 +464,7 @@ public class CalculateAverage_obourgain {
                 }
             }
             else if (length >= 4) {
-                if (UNSAFE.getInt(existingKey, BYTE_ARRAY_OFFSET_BASE + i) != UNSAFE.getInt(cityNameBuffer, BYTE_ARRAY_OFFSET_BASE + i)) {
+                if (UNSAFE.getInt(existingKey, BYTE_ARRAY_OFFSET_BASE + i) != UNSAFE.getInt(startAddress + startOfLine + i)) {
                     return false;
                 }
                 else {
@@ -471,7 +472,7 @@ public class CalculateAverage_obourgain {
                 }
             }
             for (; i < (long) length; ++i) {
-                if (UNSAFE.getByte(existingKey, BYTE_ARRAY_OFFSET_BASE + i) != UNSAFE.getByte(cityNameBuffer, BYTE_ARRAY_OFFSET_BASE + i)) {
+                if (UNSAFE.getByte(existingKey, BYTE_ARRAY_OFFSET_BASE + i) != UNSAFE.getByte(startAddress + startOfLine + i)) {
                     return false;
                 }
             }
